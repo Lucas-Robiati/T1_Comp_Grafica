@@ -1,0 +1,43 @@
+# ==============================================================================
+# config.yaml - Configurações do Sistema de Mapeamento de Objetos em Vídeo
+# ==============================================================================
+# Este arquivo controla os parâmetros de processamento, credenciais do Twilio
+# e caminhos de saída. Credenciais sensíveis também podem ser definidas via
+# variáveis de ambiente (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, etc.) ou .env.
+# ==============================================================================
+
+processing:
+  # Intervalo em segundos entre frames processados.
+  # Para vídeos de 1-2h, recomenda-se 2s para reduzir carga computacional.
+  # Diminua para 1 ou 0.5 para maior precisão (mais lento).
+  frame_interval_seconds: 2
+
+  # Confiança mínima para aceitar uma detecção do YOLO (0.0 a 1.0).
+  confidence_threshold: 0.4
+
+  # Modelo YOLOv8 a ser usado. Opções: yolov8n.pt (nano/rápido),
+  # yolov8s.pt (small), yolov8m.pt (medium), yolov8l.pt (large).
+  # O download é feito automaticamente na primeira execução.
+  model_name: "yolov8n.pt"
+
+  # Threshold de IoU para associação de detecções ao tracker.
+  # Valores mais altos exigem maior sobreposição para considerar o mesmo objeto.
+  iou_threshold: 0.3
+
+  # Número máximo de frames sem detecção antes de perder o rastreamento
+  # de um objeto. Ajuste conforme o frame_interval_seconds.
+  max_age: 10
+
+twilio:
+  # Credenciais da API Twilio para envio de SMS.
+  # Deixe vazio para desabilitar notificações SMS.
+  # Também aceita variáveis de ambiente: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, etc.
+  account_sid: ""
+  auth_token: ""
+  from_phone: ""    # Formato: "+5511999999999"
+  to_phone: ""      # Formato: "+5511999999999"
+
+output:
+  # Diretório onde os arquivos de saída serão salvos.
+  # Será criado automaticamente se não existir.
+  directory: "output"
