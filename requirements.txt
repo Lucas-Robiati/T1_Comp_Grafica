@@ -1,0 +1,12 @@
+# Dependências do Analisador de Vídeo — Visão Computacional Clássica
+# Instale com: pip install -r requirements.txt
+
+opencv-python>=4.8.0    # Processamento de vídeo e visão computacional clássica
+scipy>=1.11.0            # Distância euclidiana para o Centroid Tracker
+Pillow>=10.0.0           # Conversão de frames para exibição no Tkinter
+numpy>=1.24.0            # Operações matriciais (geralmente já vem com opencv)
+
+# tkinter é nativo do Python — não precisa instalar separadamente.
+# Se não estiver disponível, instale via:
+#   Ubuntu/Debian: sudo apt-get install python3-tk
+#   macOS (Homebrew): brew install python-tk
