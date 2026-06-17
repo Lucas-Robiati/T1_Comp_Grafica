@@ -16,6 +16,7 @@ import queue
 import time
 import os
 import shutil
+import subprocess
 
 import cv2
 import numpy as np
@@ -56,6 +57,8 @@ class CentroidTracker:
         self.max_desaparecido = max_desaparecido
         self.max_distancia = max_distancia
         self.ids_salvos = set()                    # IDs cujo recorte já foi salvo
+        self.confirmados = set()                   # IDs confirmados pelo CSRT
+        self.frames_visto = OrderedDict()          # id → frames consecutivos com CSRT ok
 
     def registrar(self, centroide: tuple, bbox: tuple) -> int:
         """Cria e registra um novo objeto, retorna o ID atribuído."""
@@ -152,6 +155,14 @@ class CentroidTracker:
 
         return self.objetos
 
+    def esta_confirmado(self, obj_id: int) -> bool:
+        """Retorna True se o objeto já foi confirmado pelo CSRT."""
+        return obj_id in self.confirmados
+
+    def confirmar(self, obj_id: int):
+        """Marca um objeto como confirmado (validado pelo CSRT)."""
+        self.confirmados.add(obj_id)
+
     def resetar(self):
         """Limpa todo o estado do tracker (para novo vídeo)."""
         self.proximo_id = 1
@@ -159,6 +170,8 @@ class CentroidTracker:
         self.bboxes.clear()
         self.desaparecidos.clear()
         self.ids_salvos.clear()
+        self.confirmados.clear()
+        self.frames_visto.clear()
 
 
 # =============================================================================
@@ -169,11 +182,19 @@ class ProcessadorVideo:
     """
     Encapsula toda a lógica de captura e análise de frames.
     Roda em thread secundária para não travar a GUI.
+
+    Pipeline híbrido de 3 estágios:
+      1. MOG2 detecta candidatos por subtração de fundo
+      2. CentroidTracker associa IDs por distância euclidiana
+      3. TrackerCSRT valida cada novo objeto — só confirma após N frames
     """
 
     # Pastas de saída
     PASTA_FRAMES   = "saida/frames"
     PASTA_OBJETOS  = "saida/objetos"
+
+    # Limites do sistema CSRT
+    MAX_CSRT_TRACKERS = 10   # Máximo de trackers CSRT simultâneos
 
     def __init__(self, fila_gui: queue.Queue):
         """
@@ -193,9 +214,13 @@ class ProcessadorVideo:
         self.limiar_binarizacao = 25      # Threshold para máscara de movimento
         self.area_minima = 500            # Área mínima de contorno (px²)
         self.max_desaparecido = 30        # Frames de tolerância no tracker
+        self.frames_confirmacao = 5       # Frames mínimos p/ CSRT confirmar objeto
 
-        # Tracker de objetos
+        # Tracker de objetos (centroide)
         self.tracker = CentroidTracker(max_desaparecido=self.max_desaparecido)
+
+        # Trackers CSRT ativos: {obj_id: cv2.legacy.TrackerCSRT}
+        self.csrt_trackers = {}
 
         # Contador sequencial de frames salvos
         self.contador_frames = 0
@@ -213,6 +238,103 @@ class ProcessadorVideo:
             if os.path.exists(pasta):
                 shutil.rmtree(pasta)   # Remove todo o conteúdo anterior
             os.makedirs(pasta)         # Recria vazia
+
+    # ------------------------------------------------------------------
+    #  Gerenciamento de CSRT trackers
+    # ------------------------------------------------------------------
+
+    def _criar_csrt(self, frame, bbox, obj_id):
+        """
+        Inicializa um TrackerCSRT para validar um novo objeto.
+
+        Se o limite de trackers simultâneos for atingido, remove o
+        tracker não-confirmado mais antigo para liberar espaço.
+        """
+        # Limita quantidade de CSRTs simultâneos
+        if len(self.csrt_trackers) >= self.MAX_CSRT_TRACKERS:
+            # Remove o mais antigo que não está confirmado
+            for old_id in list(self.csrt_trackers.keys()):
+                if not self.tracker.esta_confirmado(old_id):
+                    del self.csrt_trackers[old_id]
+                    if old_id in self.tracker.frames_visto:
+                        del self.tracker.frames_visto[old_id]
+                    break
+
+        csrt = cv2.legacy.TrackerCSRT_create()
+        (x, y, w, h) = bbox
+        # Garante bbox dentro dos limites do frame
+        x = max(0, x)
+        y = max(0, y)
+        w = min(w, frame.shape[1] - x)
+        h = min(h, frame.shape[0] - y)
+        if w > 0 and h > 0:
+            csrt.init(frame, (x, y, w, h))
+            self.csrt_trackers[obj_id] = csrt
+            self.tracker.frames_visto[obj_id] = 0
+
+    def _atualizar_csrts(self, frame):
+        """
+        Atualiza todos os trackers CSRT ativos.
+
+        Para cada tracker:
+          - Se update() retorna success=True E o centroide converge com
+            o CentroidTracker → incrementa contador de frames vistos
+          - Se atingir frames_confirmacao → marca como confirmado
+          - Se update() falha → remove o tracker (falso positivo)
+        """
+        ids_para_remover = []
+
+        for obj_id, csrt in list(self.csrt_trackers.items()):
+            # Objeto já confirmado: não precisa mais do CSRT
+            if self.tracker.esta_confirmado(obj_id):
+                ids_para_remover.append(obj_id)
+                continue
+
+            # Objeto foi desregistrado do centroide: limpa CSRT
+            if obj_id not in self.tracker.objetos:
+                ids_para_remover.append(obj_id)
+                continue
+
+            success, bbox_csrt = csrt.update(frame)
+
+            if success:
+                # Calcula centroide do CSRT
+                (cx_csrt, cy_csrt) = (
+                    int(bbox_csrt[0] + bbox_csrt[2] / 2),
+                    int(bbox_csrt[1] + bbox_csrt[3] / 2)
+                )
+                # Centroide do CentroidTracker
+                centroide_ct = self.tracker.objetos.get(obj_id)
+
+                if centroide_ct is not None:
+                    # Verifica convergência: distância entre centroides
+                    dx = abs(cx_csrt - centroide_ct[0])
+                    dy = abs(cy_csrt - centroide_ct[1])
+                    dist_centroides = (dx**2 + dy**2) ** 0.5
+
+                    # Se convergem (< max_distancia), incrementa
+                    if dist_centroides < self.tracker.max_distancia:
+                        self.tracker.frames_visto[obj_id] = \
+                            self.tracker.frames_visto.get(obj_id, 0) + 1
+
+                        # Atingiu frames mínimos → CONFIRMADO
+                        if self.tracker.frames_visto[obj_id] >= self.frames_confirmacao:
+                            self.tracker.confirmar(obj_id)
+                            ids_para_remover.append(obj_id)
+                    else:
+                        # Centroides divergem: reseta contagem
+                        self.tracker.frames_visto[obj_id] = 0
+            else:
+                # CSRT falhou → provável falso positivo
+                ids_para_remover.append(obj_id)
+                # Remove do CentroidTracker também
+                if obj_id in self.tracker.objetos:
+                    self.tracker.desregistrar(obj_id)
+
+        # Limpa trackers finalizados
+        for obj_id in ids_para_remover:
+            if obj_id in self.csrt_trackers:
+                del self.csrt_trackers[obj_id]
 
     # ------------------------------------------------------------------
     #  Loop principal de processamento
@@ -237,11 +359,12 @@ class ProcessadorVideo:
     def _loop_processamento(self):
         """
         Loop principal — roda na thread secundária.
-        Executa a pipeline de visão computacional frame a frame.
+        Pipeline híbrido: MOG2 → CentroidTracker → CSRT (confirmação).
         """
         # --- Limpeza inicial ---
         self.preparar_pastas()
         self.tracker.resetar()
+        self.csrt_trackers.clear()
         self.contador_frames = 0
 
         # --- Abre o vídeo ---
@@ -254,61 +377,49 @@ class ProcessadorVideo:
         fps_video    = cap.get(cv2.CAP_PROP_FPS) or 30
 
         # --- Subtrator de fundo MOG2 (clássico, sem IA) ---
-        # MOG2 = Mixture of Gaussians v2 — modela o fundo estatisticamente
         subtrator = cv2.createBackgroundSubtractorMOG2(
-            history=500,          # Quantidade de frames para modelar o fundo
-            varThreshold=16,      # Sensibilidade inicial (ajustado pelo slider)
-            detectShadows=True    # Detecta sombras (marcadas em cinza)
+            history=500,
+            varThreshold=16,
+            detectShadows=True
         )
 
         # Kernel morfológico para limpeza de ruídos
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
+        # IDs conhecidos antes de atualizar (para detectar novos)
+        ids_anteriores = set()
+
         frame_idx = 0
 
         while self.rodando:
-            # Respeita pausa
             if self.pausado:
                 time.sleep(0.05)
                 continue
 
             ret, frame = cap.read()
             if not ret:
-                break  # Fim do vídeo
+                break
 
             frame_idx += 1
             progresso = int((frame_idx / max(total_frames, 1)) * 100)
 
-            # ── Pré-processamento ──────────────────────────────────────
-            # Reduz o frame para acelerar o processamento
+            # ── ESTÁGIO 1: Pré-processamento + MOG2 ───────────────────
             frame_exibicao = cv2.resize(frame, (800, 450))
             frame_cinza = cv2.cvtColor(frame_exibicao, cv2.COLOR_BGR2GRAY)
             frame_blur  = cv2.GaussianBlur(frame_cinza, (21, 21), 0)
 
-            # ── Filtro 1: Subtração de fundo (detecção de movimento) ───
             mascara = subtrator.apply(frame_blur)
-
-            # Remove sombras (pixel=127) — mantém apenas movimento real (pixel=255)
             _, mascara = cv2.threshold(
-                mascara,
-                self.limiar_binarizacao,
-                255,
-                cv2.THRESH_BINARY
+                mascara, self.limiar_binarizacao, 255, cv2.THRESH_BINARY
             )
+            mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN,  kernel)
+            mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel)
+            mascara = cv2.dilate(mascara, kernel, iterations=2)
 
-            # Operações morfológicas para eliminar ruído e preencher buracos
-            mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN,  kernel)  # Remove ruído
-            mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel)  # Fecha buracos
-            mascara = cv2.dilate(mascara, kernel, iterations=2)           # Expande regiões
-
-            # ── Detecção de contornos ──────────────────────────────────
             contornos, _ = cv2.findContours(
-                mascara.copy(),
-                cv2.RETR_EXTERNAL,      # Somente contornos externos
-                cv2.CHAIN_APPROX_SIMPLE # Comprime segmentos retos
+                mascara.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
-            # Filtra contornos pela área mínima configurável
             rects_validos = []
             for c in contornos:
                 if cv2.contourArea(c) < self.area_minima:
@@ -316,23 +427,35 @@ class ProcessadorVideo:
                 (x, y, w, h) = cv2.boundingRect(c)
                 rects_validos.append((x, y, w, h))
 
-            # ── Filtro 1 — Salva frame se há movimento ─────────────────
+            # Salva frame se há movimento detectado
             if len(rects_validos) > 0:
                 self.contador_frames += 1
                 nome_frame = f"frame_{self.contador_frames}.jpg"
                 caminho_frame = os.path.join(self.PASTA_FRAMES, nome_frame)
                 cv2.imwrite(caminho_frame, frame_exibicao)
 
-            # ── Filtro 2 — Atualiza tracker e salva recortes ───────────
+            # ── ESTÁGIO 2: CentroidTracker associa IDs ─────────────────
+            ids_anteriores = set(self.tracker.objetos.keys())
             objetos = self.tracker.atualizar(rects_validos)
+            ids_atuais = set(objetos.keys())
 
-            # Salva recorte de cada objeto na primeira vez que aparece
+            # Detecta IDs novos (recém-registrados neste frame)
+            ids_novos = ids_atuais - ids_anteriores
+
+            # Inicializa CSRT para cada novo objeto
+            for obj_id in ids_novos:
+                if obj_id in self.tracker.bboxes:
+                    self._criar_csrt(frame_exibicao, self.tracker.bboxes[obj_id], obj_id)
+
+            # ── ESTÁGIO 3: CSRT valida objetos pendentes ───────────────
+            self._atualizar_csrts(frame_exibicao)
+
+            # Salva recorte SOMENTE de objetos confirmados pelo CSRT
             for obj_id, centroide in objetos.items():
-                if obj_id not in self.tracker.ids_salvos:
-                    # Busca a bbox correspondente a este id
+                if obj_id not in self.tracker.ids_salvos \
+                        and self.tracker.esta_confirmado(obj_id):
                     if obj_id in self.tracker.bboxes:
                         (x, y, w, h) = self.tracker.bboxes[obj_id]
-                        # Garante que o recorte está dentro dos limites do frame
                         x1 = max(0, x)
                         y1 = max(0, y)
                         x2 = min(frame_exibicao.shape[1], x + w)
@@ -347,25 +470,37 @@ class ProcessadorVideo:
             # ── Anotação visual no frame ───────────────────────────────
             frame_anotado = frame_exibicao.copy()
 
+            # Conta objetos confirmados para estatísticas
+            n_confirmados = len(self.tracker.confirmados & ids_atuais)
+
             for obj_id, centroide in objetos.items():
                 if obj_id in self.tracker.bboxes:
                     (x, y, w, h) = self.tracker.bboxes[obj_id]
-                    # Bounding box em verde
-                    cv2.rectangle(frame_anotado, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    # Centroide em vermelho
+
+                    # Cor depende do status: verde = confirmado, amarelo = pendente
+                    if self.tracker.esta_confirmado(obj_id):
+                        cor_bbox = (0, 255, 0)       # Verde — confirmado
+                        cor_texto = (0, 255, 255)     # Ciano
+                        status = ""
+                    else:
+                        cor_bbox = (0, 200, 255)      # Amarelo/laranja — pendente
+                        cor_texto = (0, 200, 255)
+                        frames_v = self.tracker.frames_visto.get(obj_id, 0)
+                        status = f" ({frames_v}/{self.frames_confirmacao})"
+
+                    cv2.rectangle(frame_anotado, (x, y), (x+w, y+h), cor_bbox, 2)
                     cv2.circle(frame_anotado, centroide, 4, (0, 0, 255), -1)
-                    # Rótulo do ID
                     cv2.putText(
                         frame_anotado,
-                        f"ID {obj_id}",
+                        f"ID {obj_id}{status}",
                         (x, y - 8),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
-                        (0, 255, 255),
+                        cor_texto,
                         2
                     )
 
-            # Máscara de movimento em mini-preview (canto superior direito)
+            # Máscara de movimento em mini-preview
             mascara_rgb = cv2.cvtColor(mascara, cv2.COLOR_GRAY2BGR)
             h_mini = frame_anotado.shape[0] // 4
             w_mini = frame_anotado.shape[1] // 4
@@ -375,29 +510,31 @@ class ProcessadorVideo:
             # Informações de status no frame
             cv2.putText(
                 frame_anotado,
-                f"Frame: {frame_idx}/{total_frames}  |  Objetos: {len(objetos)}  |  Salvos: {self.contador_frames}",
+                f"Frame: {frame_idx}/{total_frames}  |  "
+                f"Ativos: {len(objetos)}  |  "
+                f"Confirmados: {n_confirmados}  |  "
+                f"Salvos: {self.contador_frames}",
                 (8, frame_anotado.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                0.40,
                 (200, 200, 200),
                 1
             )
 
             # ── Envia frame para a GUI ─────────────────────────────────
-            # Converte BGR → RGB para exibição no Tkinter
             frame_rgb = cv2.cvtColor(frame_anotado, cv2.COLOR_BGR2RGB)
             self.fila_gui.put(("frame", frame_rgb, progresso,
                                len(objetos), self.contador_frames,
-                               self.tracker.proximo_id - 1))
+                               n_confirmados))
 
-            # Controle de FPS (não exibe mais rápido que o vídeo original)
             time.sleep(1.0 / fps_video)
 
         cap.release()
         self.rodando = False
+        n_confirmados_total = len(self.tracker.confirmados)
         self.fila_gui.put(("concluido",
                             self.contador_frames,
-                            self.tracker.proximo_id - 1))
+                            n_confirmados_total))
 
 
 # =============================================================================
@@ -435,10 +572,12 @@ class AppAnaliseVideo:
 
         # Variáveis de estado da GUI
         self.caminho_video = tk.StringVar(value="Nenhum arquivo selecionado")
-        self.var_limiar    = tk.IntVar(value=25)
-        self.var_area      = tk.IntVar(value=500)
-        self.var_persist   = tk.IntVar(value=30)
-        self.var_progresso = tk.DoubleVar(value=0.0)
+        self.var_limiar      = tk.IntVar(value=25)
+        self.var_area        = tk.IntVar(value=500)
+        self.var_persist     = tk.IntVar(value=30)
+        self.var_confirmacao = tk.IntVar(value=5)
+        self.var_progresso   = tk.DoubleVar(value=0.0)
+        self.ultimo_frame_rgb = None
 
         self._construir_ui()
         self._poll_fila()   # Inicia verificação periódica da fila
@@ -463,7 +602,7 @@ class AppAnaliseVideo:
 
         tk.Label(
             topo,
-            text="sem IA · OpenCV · MOG2 · Centroid Tracker",
+            text="sem IA · OpenCV · MOG2 · Centroid + CSRT",
             font=("Segoe UI", 9),
             bg=self.COR_FUNDO,
             fg=self.COR_SUBTEXTO
@@ -482,23 +621,59 @@ class AppAnaliseVideo:
             highlightbackground=self.COR_ACENTO
         )
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.canvas.create_text(
-            400, 225,
-            text="Selecione um arquivo de vídeo para começar",
-            fill=self.COR_SUBTEXTO,
-            font=("Segoe UI", 13),
-            tags="placeholder"
-        )
+        self.canvas.bind("<Configure>", self._ao_redimensionar_canvas)
 
-        # Painel direito
-        painel = tk.Frame(corpo, bg=self.COR_PAINEL, width=260)
-        painel.pack(side="right", fill="y", padx=(10, 0))
-        painel.pack_propagate(False)
+        # Painel direito (com Scrollbar para evitar corte de widgets)
+        container_painel = tk.Frame(corpo, bg=self.COR_PAINEL, width=280)
+        container_painel.pack(side="right", fill="y", padx=(10, 0))
+        container_painel.pack_propagate(False)
+
+        canvas_scroll = tk.Canvas(container_painel, bg=self.COR_PAINEL, highlightthickness=0)
+        canvas_scroll.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(container_painel, orient="vertical", command=canvas_scroll.yview)
+        scrollbar.pack(side="right", fill="y")
+
+        canvas_scroll.configure(yscrollcommand=scrollbar.set)
+
+        # Frame interno que realmente conterá os widgets
+        painel = tk.Frame(canvas_scroll, bg=self.COR_PAINEL)
+        canvas_window = canvas_scroll.create_window((0, 0), window=painel, anchor="nw")
+
+        def _on_frame_configure(event):
+            canvas_scroll.configure(scrollregion=canvas_scroll.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas_scroll.itemconfig(canvas_window, width=event.width)
+
+        painel.bind("<Configure>", _on_frame_configure)
+        canvas_scroll.bind("<Configure>", _on_canvas_configure)
+
+        # Habilita scroll com a roda do mouse
+        def _on_mousewheel(event):
+            canvas_scroll.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _on_mousewheel_up(event):
+            canvas_scroll.yview_scroll(-1, "units")
+
+        def _on_mousewheel_down(event):
+            canvas_scroll.yview_scroll(1, "units")
 
         self._painel_arquivo(painel)
         self._painel_parametros(painel)
         self._painel_controles(painel)
         self._painel_estatisticas(painel)
+
+        # Registra a rolagem de mouse de forma recursiva em todos os filhos
+        def _registrar_scroll_recursivo(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            widget.bind("<Button-4>", _on_mousewheel_up)
+            widget.bind("<Button-5>", _on_mousewheel_down)
+            for filho in widget.winfo_children():
+                _registrar_scroll_recursivo(filho)
+
+        _registrar_scroll_recursivo(canvas_scroll)
+        _registrar_scroll_recursivo(painel)
 
         # ── Barra de progresso ─────────────────────────────────────────
         rodape = tk.Frame(self.raiz, bg=self.COR_FUNDO)
@@ -584,6 +759,16 @@ class AppAnaliseVideo:
             dica="Frames sem detecção antes de esquecer objeto"
         )
 
+        # Slider: Frames para confirmação CSRT
+        self._slider(
+            frame,
+            label="Confirmação CSRT (frames)",
+            variavel=self.var_confirmacao,
+            minval=2, maxval=30,
+            callback=self._atualizar_confirmacao,
+            dica="Frames consecutivos p/ confirmar objeto"
+        )
+
     def _painel_controles(self, pai):
         """Botões de controle: Iniciar / Pausar / Parar."""
         frame = self._secao(pai, "▶  Controles")
@@ -628,7 +813,7 @@ class AppAnaliseVideo:
         frame = self._secao(pai, "📊  Estatísticas em Tempo Real")
 
         self.stat_frames   = self._stat_linha(frame, "Frames com movimento:", "0")
-        self.stat_objetos  = self._stat_linha(frame, "Objetos rastreados:",   "0")
+        self.stat_objetos  = self._stat_linha(frame, "Confirmados (CSRT):",   "0")
         self.stat_ativos   = self._stat_linha(frame, "Objetos ativos agora:", "0")
         self.stat_status   = self._stat_linha(frame, "Status:",               "Aguardando")
 
@@ -655,29 +840,32 @@ class AppAnaliseVideo:
         return wrapper
 
     def _slider(self, pai, label, variavel, minval, maxval, callback, dica=""):
-        """Cria um slider com rótulo e exibição de valor."""
+        """Cria um slider com rótulo e exibição de valor de forma compacta."""
         row = tk.Frame(pai, bg=self.COR_PAINEL)
         row.pack(fill="x", pady=4)
 
+        # Linha do topo: Rótulo à esquerda, Valor em destaque à direita
+        topo_linha = tk.Frame(row, bg=self.COR_PAINEL)
+        topo_linha.pack(fill="x")
+
         tk.Label(
-            row, text=label,
+            topo_linha, text=label,
             bg=self.COR_PAINEL, fg=self.COR_TEXTO,
-            font=("Segoe UI", 8)
-        ).pack(anchor="w")
+            font=("Segoe UI", 8, "bold")
+        ).pack(side="left", anchor="w")
+
+        lbl_val = tk.Label(
+            topo_linha, textvariable=variavel,
+            bg=self.COR_PAINEL, fg=self.COR_ACENTO,
+            font=("Segoe UI", 8, "bold")
+        ).pack(side="right", anchor="e")
 
         if dica:
             tk.Label(
                 row, text=dica,
                 bg=self.COR_PAINEL, fg=self.COR_SUBTEXTO,
                 font=("Segoe UI", 7)
-            ).pack(anchor="w")
-
-        lbl_val = tk.Label(
-            row, textvariable=variavel,
-            bg=self.COR_PAINEL, fg=self.COR_ACENTO,
-            font=("Segoe UI", 8, "bold"), width=5
-        )
-        lbl_val.pack(side="right")
+            ).pack(anchor="w", pady=(0, 2))
 
         sl = tk.Scale(
             row,
@@ -690,7 +878,7 @@ class AppAnaliseVideo:
             showvalue=False,
             command=callback
         )
-        sl.pack(fill="x", side="left", expand=True)
+        sl.pack(fill="x", expand=True)
 
     def _stat_linha(self, pai, rotulo: str, valor_inicial: str) -> tk.Label:
         """Cria uma linha de estatística com rótulo e valor dinâmico."""
@@ -716,14 +904,54 @@ class AppAnaliseVideo:
     # ------------------------------------------------------------------
 
     def _selecionar_video(self):
-        """Abre diálogo de seleção de arquivo de vídeo."""
-        caminho = filedialog.askopenfilename(
-            title="Selecionar Vídeo",
-            filetypes=[
-                ("Arquivos de Vídeo", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv"),
-                ("Todos os arquivos", "*.*")
-            ]
-        )
+        """
+        Abre o gerenciador de arquivos nativo do sistema via zenity/kdialog.
+        Fallback para tkinter.filedialog caso não esteja disponível.
+        """
+        caminho = None
+
+        # Tenta zenity (GNOME/GTK)
+        try:
+            resultado = subprocess.run(
+                [
+                    "zenity", "--file-selection",
+                    "--title=Selecionar Vídeo",
+                    "--file-filter=Vídeos (mp4 avi mkv mov) | *.mp4 *.avi *.mkv *.mov *.wmv *.flv",
+                    "--file-filter=Todos os arquivos | *"
+                ],
+                capture_output=True, text=True, timeout=120
+            )
+            if resultado.returncode == 0 and resultado.stdout.strip():
+                caminho = resultado.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Tenta kdialog (KDE) se zenity falhou
+        if caminho is None:
+            try:
+                resultado = subprocess.run(
+                    [
+                        "kdialog", "--getopenfilename",
+                        os.path.expanduser("~"),
+                        "Vídeos (*.mp4 *.avi *.mkv *.mov *.wmv *.flv)"
+                    ],
+                    capture_output=True, text=True, timeout=120
+                )
+                if resultado.returncode == 0 and resultado.stdout.strip():
+                    caminho = resultado.stdout.strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Fallback: tkinter filedialog
+        if caminho is None:
+            caminho = filedialog.askopenfilename(
+                title="Selecionar Vídeo",
+                filetypes=[
+                    ("Arquivos de Vídeo", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv"),
+                    ("Todos os arquivos", "*.*")
+                ]
+            )
+
         if caminho:
             self.caminho_video.set(os.path.basename(caminho))
             self._caminho_completo = caminho
@@ -743,6 +971,7 @@ class AppAnaliseVideo:
         self.processador.area_minima        = self.var_area.get()
         self.processador.max_desaparecido   = self.var_persist.get()
         self.processador.tracker.max_desaparecido = self.var_persist.get()
+        self.processador.frames_confirmacao = self.var_confirmacao.get()
 
         # Atualiza botões
         self.btn_iniciar.config(state="disabled")
@@ -785,6 +1014,9 @@ class AppAnaliseVideo:
         self.processador.max_desaparecido = v
         self.processador.tracker.max_desaparecido = v
 
+    def _atualizar_confirmacao(self, val):
+        self.processador.frames_confirmacao = int(val)
+
     # ------------------------------------------------------------------
     #  Poll da fila (atualização da GUI na thread principal)
     # ------------------------------------------------------------------
@@ -821,8 +1053,10 @@ class AppAnaliseVideo:
                         f"Análise finalizada!\n\n"
                         f"• Frames com movimento salvos: {n_frames}\n"
                         f"  → Pasta: saida/frames/\n\n"
-                        f"• Objetos únicos rastreados: {n_total}\n"
-                        f"  → Pasta: saida/objetos/"
+                        f"• Objetos confirmados (CSRT): {n_total}\n"
+                        f"  → Pasta: saida/objetos/\n\n"
+                        f"ℹ Objetos que duraram < {self.var_confirmacao.get()} frames\n"
+                        f"  foram descartados como falsos positivos."
                     )
 
                 elif tipo == "erro":
@@ -838,16 +1072,54 @@ class AppAnaliseVideo:
         self.raiz.after(30, self._poll_fila)
 
     def _exibir_frame(self, frame_rgb: np.ndarray):
-        """Converte um array NumPy RGB em imagem Tkinter e exibe no canvas."""
+        """Converte um array NumPy RGB em imagem Tkinter e exibe no canvas, mantendo a proporção."""
+        self.ultimo_frame_rgb = frame_rgb
         img_pil = Image.fromarray(frame_rgb)
 
-        # Ajusta ao tamanho atual do canvas
+        # Ajusta ao tamanho atual do canvas mantendo proporção (Aspect Ratio)
         cw = self.canvas.winfo_width()  or 800
         ch = self.canvas.winfo_height() or 450
-        img_pil = img_pil.resize((cw, ch), Image.LANCZOS)
+
+        largura_original, altura_original = img_pil.size
+        proporcao_img = largura_original / altura_original
+        proporcao_canvas = cw / ch
+
+        if proporcao_canvas > proporcao_img:
+            # Canvas é mais largo que a imagem (barra preta nas laterais)
+            nova_altura = ch
+            nova_largura = int(ch * proporcao_img)
+        else:
+            # Canvas é mais alto que a imagem (barra preta no topo/baixo)
+            nova_largura = cw
+            nova_altura = int(cw / proporcao_img)
+
+        # Redimensiona mantendo qualidade e proporção (valores mínimos de 1 para evitar crash de tamanho 0)
+        img_pil = img_pil.resize((max(nova_largura, 1), max(nova_altura, 1)), Image.LANCZOS)
 
         self._img_tk = ImageTk.PhotoImage(img_pil)
-        self.canvas.create_image(0, 0, anchor="nw", image=self._img_tk)
+        
+        # Centraliza a imagem no Canvas
+        x_pos = (cw - nova_largura) // 2
+        y_pos = (ch - nova_altura) // 2
+
+        self.canvas.delete("all")
+        self.canvas.create_image(x_pos, y_pos, anchor="nw", image=self._img_tk)
+
+    def _ao_redimensionar_canvas(self, event):
+        """Manipula o redimensionamento do canvas para atualizar o frame ou centralizar o placeholder."""
+        if hasattr(self, "ultimo_frame_rgb") and self.ultimo_frame_rgb is not None:
+            self._exibir_frame(self.ultimo_frame_rgb)
+        else:
+            cw = event.width
+            ch = event.height
+            self.canvas.delete("all")
+            self.canvas.create_text(
+                cw // 2, ch // 2,
+                text="Selecione um arquivo de vídeo para começar",
+                fill=self.COR_SUBTEXTO,
+                font=("Segoe UI", 13),
+                tags="placeholder"
+            )
 
 
 # =============================================================================
@@ -856,8 +1128,8 @@ class AppAnaliseVideo:
 
 def main():
     raiz = tk.Tk()
-    raiz.geometry("1120x580")
-    raiz.minsize(900, 500)
+    raiz.geometry("1150x640")
+    raiz.minsize(950, 550)
 
     # Estilo da barra de progresso via ttk
     estilo = ttk.Style()
