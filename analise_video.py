@@ -54,8 +54,8 @@ class AppAnaliseVideo:
 
         # Variáveis de estado da GUI
         self.caminho_video = tk.StringVar(value="Nenhum arquivo selecionado")
-        self.var_limiar      = tk.IntVar(value=220)
-        self.var_area        = tk.IntVar(value=500)
+        self.var_threshold   = tk.IntVar(value=25)
+        self.var_area        = tk.IntVar(value=100)
         self.var_persist     = tk.IntVar(value=30)
         self.var_confirmacao = tk.IntVar(value=5)
         self.var_progresso   = tk.DoubleVar(value=0.0)
@@ -214,11 +214,11 @@ class AppAnaliseVideo:
         # Slider: Limiar de binarização
         self._slider(
             frame,
-            label="Limiar da Máscara MOG2",
-            variavel=self.var_limiar,
-            minval=200, maxval=255,
-            callback=self._atualizar_limiar,
-            dica="Mantém apenas foreground forte e reduz ruído residual"
+            label="Threshold VAR do MOG2",
+            variavel=self.var_threshold,
+            minval=10, maxval=100,
+            callback=self._atualizar_threshold,
+            dica="Menor = mais sensível; maior = mais conservador"
         )
 
         # Slider: Área mínima
@@ -449,7 +449,7 @@ class AppAnaliseVideo:
             return
 
         # Aplica parâmetros atuais
-        self.processador.limiar_binarizacao = self.var_limiar.get()
+        self.processador.var_threshold = self.var_threshold.get()
         self.processador.area_minima        = self.var_area.get()
         self.processador.max_desaparecido   = self.var_persist.get()
         self.processador.tracker.max_desaparecido = self.var_persist.get()
@@ -485,8 +485,8 @@ class AppAnaliseVideo:
         self.btn_parar.config(state="disabled")
         self.stat_status.config(text="Interrompido", fg=self.COR_BOTAO_STOP)
 
-    def _atualizar_limiar(self, val):
-        self.processador.limiar_binarizacao = int(val)
+    def _atualizar_threshold(self, val):
+        self.processador.var_threshold = int(val)
 
     def _atualizar_area(self, val):
         self.processador.area_minima = int(val)
