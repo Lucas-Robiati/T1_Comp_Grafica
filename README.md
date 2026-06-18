@@ -1,6 +1,6 @@
 # 🎬 Analisador de Vídeo — OpenCV
 
-Sistema de detecção e rastreamento de objetos em vídeo usando uma abordagem híbrida avançada e inteiramente clássica (sem Deep Learning pré-treinado como YOLO).
+Sistema de detecção e rastreamento de objetos em vídeo
 
 ---
 
