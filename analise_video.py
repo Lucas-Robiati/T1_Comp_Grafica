@@ -76,7 +76,7 @@ class AppAnaliseVideo:
 
         tk.Label(
             topo,
-            text="🎬  Analisador de Vídeo — Visão Clássica",
+            text="🎬  Analisador de Vídeo — Visão Clássica (v2)",
             font=("Segoe UI", 16, "bold"),
             bg=self.COR_FUNDO,
             fg=self.COR_TEXTO
@@ -84,7 +84,7 @@ class AppAnaliseVideo:
 
         tk.Label(
             topo,
-            text="OpenCV · MOG2 · Centroid + CSRT",
+            text="OpenCV · MOG2 · Kalman + NMS + CSRT",
             font=("Segoe UI", 9),
             bg=self.COR_FUNDO,
             fg=self.COR_SUBTEXTO
