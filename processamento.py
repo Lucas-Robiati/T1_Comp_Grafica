@@ -1,10 +1,5 @@
 """
-=============================================================================
- SISTEMA DE ANÁLISE DE VÍDEO - MÓDULO DE PROCESSAMENTO DE IMAGEM
-=============================================================================
  Pipeline: MOG2 + CLAHE + NMS + Kalman(Húngaro) + CSRT(validador)
- Correções: NMS anti-duplicata, dedup por histograma, zona de warmup
-=============================================================================
 """
 
 import os
@@ -19,9 +14,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-# =====================================================================
 #  NMS — Non-Maximum Suppression para bboxes
-# =====================================================================
 
 def nms_bboxes(bboxes, iou_thresh=0.45):
     """Remove bboxes sobrepostas, mantendo a de maior área."""
@@ -57,15 +50,9 @@ def _iou_pair(b1, b2):
     return inter / union if union > 0 else 0.0
 
 
-# =====================================================================
 #  KALMAN TRACKER — Rastreamento com Kalman + Húngaro + anti-duplicata
-# =====================================================================
 
 class KalmanTracker:
-    """
-    Rastreador com Filtro de Kalman por objeto, associação húngara (IoU),
-    cooldown de registro e deduplicação por distância de centroide.
-    """
 
     def __init__(self, max_desaparecido=30, iou_minimo=0.20, min_dist_novo=50):
         self.proximo_id = 1
@@ -75,9 +62,9 @@ class KalmanTracker:
         self.frames_visto = OrderedDict()
         self.confirmados = set()
         self.ids_salvos = set()
-        self.max_desaparecido = max_desaparecido
-        self.iou_minimo = iou_minimo
-        self.min_dist_novo = min_dist_novo  # Distância mínima para registrar novo obj
+        self.max_desaparecido = max_desaparecido    # Tempo de sobrevida de um objeto antes esquecê-lo
+        self.iou_minimo = iou_minimo                # Remove bboxes sobrepostas, mantendo a de maior area
+        self.min_dist_novo = min_dist_novo          # Distância mínima para registrar novo obj
 
     def _criar_filtro(self, cx, cy):
         kf = cv2.KalmanFilter(4, 2)
@@ -102,7 +89,7 @@ class KalmanTracker:
         return ((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2) ** 0.5
 
     def _perto_de_existente(self, cx, cy):
-        """Retorna True se (cx,cy) está muito perto de um objeto já ativo."""
+        #Retorna True se (cx,cy) está muito perto de um objeto já ativo
         for fid in self.filtros:
             if fid in self.bboxes:
                 ec = self._centroide(self.bboxes[fid])
@@ -134,7 +121,7 @@ class KalmanTracker:
         return preditos
 
     def atualizar(self, rects):
-        """Associação húngara com IoU + cooldown de registro."""
+
         preditos = self.predizer_bboxes()
 
         if len(rects) == 0:
@@ -210,16 +197,9 @@ class KalmanTracker:
         self.confirmados.clear()
         self.ids_salvos.clear()
 
-
-# =====================================================================
 #  PROCESSADOR DE VÍDEO
-# =====================================================================
 
 class ProcessadorVideo:
-    """
-    Pipeline: Pré-proc → MOG2 → Morfologia → NMS → Kalman → CSRT(validador)
-    Sem Optical Flow. CSRT não corrige Kalman. Dedup por histograma.
-    """
 
     PASTA_FRAMES = "saida/frames"
     PASTA_OBJETOS = "saida/objetos"
@@ -271,14 +251,12 @@ class ProcessadorVideo:
         return float(cv2.Laplacian(cinza, cv2.CV_64F).var())
 
     def _calc_histograma(self, recorte):
-        """Histograma HSV normalizado para deduplicação por aparência."""
         hsv = cv2.cvtColor(recorte, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
         cv2.normalize(hist, hist)
         return hist
 
     def _eh_duplicata_aparencia(self, recorte, limiar=0.35):
-        """Compara histograma do recorte com objetos já salvos."""
         hist_novo = self._calc_histograma(recorte)
         for oid, hist_salvo in self._histogramas_salvos.items():
             dist = cv2.compareHist(hist_novo, hist_salvo, cv2.HISTCMP_BHATTACHARYYA)
@@ -349,7 +327,6 @@ class ProcessadorVideo:
                 ids_remover.append(obj_id)
                 continue
 
-            # Verifica convergência com a bbox do Kalman (sem corrigir o Kalman)
             bbox_kt = self.tracker.bboxes.get(obj_id)
             if bbox_kt:
                 iou = _iou_pair((x_c, y_c, w_c, h_c), bbox_kt)
@@ -468,7 +445,6 @@ class ProcessadorVideo:
                 time.sleep(1.0 / fps_video)
                 continue
 
-            # Morfologia agressiva
             mascara = cv2.medianBlur(mascara, 5)
             mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel_open)
             mascara = cv2.dilate(mascara, kernel_dilate, iterations=1)
@@ -515,7 +491,6 @@ class ProcessadorVideo:
                                  f"frame_{self.contador_frames}.jpg"),
                     frame_exibicao)
 
-            # Kalman Tracker
             ids_anteriores = set(self.tracker.filtros.keys())
             objetos = self.tracker.atualizar(rects_validos)
             ids_novos = set(objetos.keys()) - ids_anteriores
